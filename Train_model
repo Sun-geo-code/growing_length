@@ -1,0 +1,527 @@
+
+from __future__ import annotations
+
+import argparse
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from importlib.metadata import version
+import json
+import math
+from pathlib import Path
+import re
+from typing import Any
+
+import numpy as np
+import optuna
+import pandas as pd
+from pyproj import Transformer
+from scipy.spatial import cKDTree
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+import xarray as xr
+import xgboost as xgb
+
+
+DYNAMIC_FEATURE_NAMES = [
+    "GSL", "GS_temp", "GS_SM", "GS_SSRD", "GS_RH", "GS_SPEI",
+    "NGS_temp", "NGS_SM", "NGS_SSRD", "NGS_RH", "NGS_SPEI",
+]
+STATIC_FEATURE_NAMES = ["Soil_clay", "Soil_soc", "IGBP"]
+ALL_FEATURE_NAMES = DYNAMIC_FEATURE_NAMES + STATIC_FEATURE_NAMES
+IGBP_CLASSES = list(range(1, 11))
+CLIMATE_VARIABLES = {
+    "GS_temp": "GS_TEMP_C", "GS_SM": "GS_SM_0_100cm_m3m3",
+    "GS_SSRD": "GS_SSRD_Wm2", "GS_RH": "GS_RH_percent",
+    "NGS_temp": "NGS_TEMP_C", "NGS_SM": "NGS_SM_0_100cm_m3m3",
+    "NGS_SSRD": "NGS_SSRD_Wm2", "NGS_RH": "NGS_RH_percent",
+}
+SEARCH_SPACE = {
+    "n_estimators": {"type": "int", "low": 100, "high": 1000},
+    "max_depth": {"type": "int", "low": 3, "high": 12},
+    "learning_rate": {"type": "float", "low": 0.01, "high": 0.2},
+    "subsample": {"type": "float", "low": 0.6, "high": 1.0},
+    "colsample_bytree": {"type": "float", "low": 0.6, "high": 1.0},
+    "gamma": {"type": "float", "low": 1e-6, "high": 1.0, "log": True},
+}
+TEMPORAL_YEARS = {"train": (2001, 2014), "validation": (2016, 2018), "test": (2020, 2024)}
+SUBSETS = ("train", "validation", "test")
+
+
+@dataclass
+class Samples:
+    X: pd.DataFrame
+    y: np.ndarray
+    coordinates: pd.DataFrame
+    metadata: dict[str, Any]
+
+
+@dataclass
+class Split:
+    scheme: str
+    assignment: np.ndarray
+    details: pd.DataFrame
+    metadata: dict[str, Any]
+
+    def indices(self, subset):
+        return np.flatnonzero(self.assignment == subset)
+
+
+def write_json(path, values):
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    Path(path).write_text(json.dumps(values, ensure_ascii=False, indent=2, allow_nan=False), encoding="utf-8")
+
+
+def template_config():
+    return {
+        "output_dir": "XGBoost_blocked_results",
+        "years": [2001, 2024], "latitude_range": [30, 90], "minimum_gsl_days": 50,
+        "n_trials": 50, "model_n_jobs": 8,
+        "seeds": {"spatial_split": 42, "optuna": 42, "xgboost": 42},
+        "spatial": {"epsg": 6931, "block_size_km": 500, "buffer_km": 100,
+                    "fractions": [0.6, 0.2, 0.2]},
+        "schemes": ["spatial", "temporal"],
+        "data": {
+            "gsl": {"file": "path/2001_2024_GSL_MODIS_phenology.nc", "variable": "GSL"},
+            "climate": {"file": "path/Climate_GS_NGS_2001_2024.nc", "variables": CLIMATE_VARIABLES},
+            "spei": {"file": "path/SPEI_GS_NGS_2001_2024.nc",
+                     "variables": {"GS_SPEI": "GS_SPEI_03", "NGS_SPEI": "NGS_SPEI_03"}},
+            "igbp": {"file": "path/Landtype.nc", "variable": "IGBP"},
+            "soil_clay": {"file": "path/T_CLAY_0.25deg.nc", "variable": "T_CLAY"},
+            "soil_soc": {"file": "path/T_OC_0.25deg.nc", "variable": "T_OC"},
+            "static_alignment": "nearest", "static_tolerance_degrees": 0.26,
+        },
+        "responses": [
+            {"name": "GLASS_GPP", "kind": "GPP", "enabled": True, "format": "netcdf",
+             "file": "path/2001_2024_GLASS_GPP.nc", "variable": "GPP", "minimum_response": 0},
+            {"name": "LHSIF", "kind": "LHSIF", "enabled": False, "format": "netcdf",
+             "file": "path/LHSIF_annual_2001_2024_aligned.nc", "variable": "LHSIF_annual_sum",
+             "minimum_response": None},
+            {"name": "FLUXNET_GPP", "kind": "FLUXNET", "enabled": False, "format": "csv",
+             "file": "path/annual_fluxnet_predictors.csv", "target_column": "GPP",
+             "year_column": "year", "latitude_column": "latitude", "longitude_column": "longitude",
+             "cell_id_column": "site_id", "minimum_response": 0},
+        ] + [{"name": f"TRENDY_model_{i:02d}", "kind": "TRENDY", "enabled": False,
+              "format": "netcdf", "file": f"path/TRENDY_model_{i:02d}_annual_GPP.nc",
+              "variable": "GPP", "minimum_response": 0} for i in range(1, 14)],
+        "note": "Replace paths and TRENDY model names. Enable each response to run. CSV inputs must already contain every ALL_FEATURE_NAMES predictor in the required physical units.",
+    }
+
+
+def resolve_file(value, base):
+    path = Path(value)
+    if not path.is_absolute():
+        path = base / path
+    if not path.is_file():
+        raise FileNotFoundError(f"Input file does not exist: {path}. Fill the paths in the configuration.")
+    return path
+
+
+def calendar_years(coord):
+    try:
+        values = coord.dt.year.values
+    except (AttributeError, TypeError, ValueError):
+        raw = np.asarray(coord.values, dtype=float)
+        if not np.isfinite(raw).all() or not np.allclose(raw, np.round(raw), atol=1e-6, rtol=0):
+            raise ValueError("Annual coordinates must be dates or integer calendar years.")
+        values = np.round(raw).astype(int)
+    return np.asarray(values, dtype=int)
+
+
+def read_field(entry, variable, cfg, base, annual):
+    path = resolve_file(entry["file"], base)
+    with xr.open_dataset(path) as ds:
+        if variable not in ds:
+            raise KeyError(f"{variable} not found in {path}")
+        a = ds[variable].sel(entry.get("selectors", {})).sortby("lat").sortby("lon")
+        a = a.sel(lat=slice(*cfg["latitude_range"]))
+        if annual:
+            dim = entry.get("time_dimension") or ("year" if "year" in a.dims else "time")
+            years = calendar_years(a[dim])
+            if len(np.unique(years)) != len(years):
+                raise ValueError(f"{path}: expected annual observations, found repeated calendar years.")
+            a = a.assign_coords({dim: years})
+            if dim != "year":
+                a = a.rename({dim: "year"})
+            a = a.sel(year=slice(*cfg["years"])).sortby("year")
+            if set(a.dims) != {"year", "lat", "lon"}:
+                raise ValueError(f"{path}: select extra dimensions explicitly with selectors.")
+            a = a.transpose("year", "lat", "lon")
+        else:
+            for dim in list(a.dims):
+                if dim not in ("lat", "lon") and a.sizes[dim] == 1:
+                    a = a.isel({dim: 0}, drop=True)
+            if set(a.dims) != {"lat", "lon"}:
+                raise ValueError(f"{path}: static input must have only lat/lon dimensions after selectors.")
+            a = a.transpose("lat", "lon")
+        return a.load()
+
+
+def require_dynamic_match(reference, candidate, name):
+    for dim in ("year", "lat", "lon"):
+        if not np.array_equal(reference[dim].values, candidate[dim].values):
+            raise ValueError(f"{name}: {dim} coordinates do not exactly match GSL. Harmonize the grids before training; positional matching is not used.")
+
+
+def load_grid_predictors(cfg, base):
+    data = cfg["data"]
+    gsl = read_field(data["gsl"], data["gsl"]["variable"], cfg, base, True)
+    expected = np.arange(cfg["years"][0], cfg["years"][1] + 1)
+    if not np.array_equal(gsl.year.values, expected):
+        raise ValueError("GSL must supply all annual grids in the configured period.")
+    fields = {"GSL": gsl}
+    for group in ("climate", "spei"):
+        for name, variable in data[group]["variables"].items():
+            a = read_field(data[group], variable, cfg, base, True)
+            require_dynamic_match(gsl, a, name)
+            fields[name] = a
+    if set(fields) != set(DYNAMIC_FEATURE_NAMES):
+        raise ValueError(f"Dynamic predictor mapping must include exactly {DYNAMIC_FEATURE_NAMES}.")
+    reference = gsl.isel(year=0, drop=True)
+    for key, name in (("soil_clay", "Soil_clay"), ("soil_soc", "Soil_soc"), ("igbp", "IGBP")):
+        a = read_field(data[key], data[key]["variable"], cfg, base, False)
+        if data.get("static_alignment", "nearest") == "nearest":
+            a = a.reindex(lat=reference.lat, lon=reference.lon, method="nearest",
+                          tolerance=data.get("static_tolerance_degrees", 0.26))
+        elif data["static_alignment"] != "strict":
+            raise ValueError("static_alignment must be strict or nearest.")
+        for dim in ("lat", "lon"):
+            if not np.array_equal(a[dim].values, reference[dim].values):
+                raise ValueError(f"{name} coordinates do not match GSL.")
+        fields[name] = a
+    return fields
+
+
+def prepare_features(X):
+    X = X.loc[:, ALL_FEATURE_NAMES].copy()
+    for name in ALL_FEATURE_NAMES[:-1]:
+        X[name] = X[name].astype(np.float32)
+    values = X["IGBP"].to_numpy(dtype=float)
+    if not np.isin(values, IGBP_CLASSES).all():
+        raise ValueError("IGBP must use integer categories 1–10.")
+    X["IGBP"] = pd.Categorical(values.astype(np.int16), categories=IGBP_CLASSES)
+    return X
+
+
+def load_gridded_samples(cfg, response, base, fields):
+    target = read_field(response, response["variable"], cfg, base, True)
+    gsl = fields["GSL"]
+    require_dynamic_match(gsl, target, response["name"])
+    valid = np.isfinite(target.values)
+    if response.get("minimum_response") is not None:
+        valid &= target.values > response["minimum_response"]
+    for name in DYNAMIC_FEATURE_NAMES:
+        valid &= np.isfinite(fields[name].values)
+    valid &= gsl.values > cfg.get("minimum_gsl_days", 50)
+    static_valid = np.isin(fields["IGBP"].values, IGBP_CLASSES)
+    for name in STATIC_FEATURE_NAMES:
+        static_valid &= np.isfinite(fields[name].values)
+    valid &= static_valid[None, :, :]
+    iy, ilat, ilon = np.where(valid)
+    if not len(iy):
+        raise ValueError(f"No valid annual observations for {response['name']}.")
+    values = {name: fields[name].values[iy, ilat, ilon] for name in DYNAMIC_FEATURE_NAMES}
+    values.update({name: fields[name].values[ilat, ilon] for name in STATIC_FEATURE_NAMES})
+    coordinates = pd.DataFrame({"cell_id": ilat.astype(np.int64) * gsl.sizes["lon"] + ilon,
+                                "year": gsl.year.values[iy].astype(int),
+                                "latitude": gsl.lat.values[ilat], "longitude": gsl.lon.values[ilon]})
+    return Samples(prepare_features(pd.DataFrame(values)), target.values[iy, ilat, ilon].astype(float),
+                   coordinates, {"format": "netcdf", "response": response,
+                                 "validity": "Finite predictors/response for each cell-year; finite static features; IGBP 1–10; GSL above configured minimum; optional response lower bound. Missing future/test years do not remove otherwise valid training-year records.",
+                                 "spatial_reference": "GSL coordinates; dynamic inputs must match exactly",
+                                 "seasonal_climate": "Provided precomputed GS/NGS monthly summaries; not recomputed here."})
+
+
+def load_tabular_samples(cfg, response, base):
+    path = resolve_file(response["file"], base)
+    frame = pd.read_parquet(path) if response["format"] == "parquet" else pd.read_csv(path)
+    rename = {response.get("year_column", "year"): "year",
+              response.get("latitude_column", "latitude"): "latitude",
+              response.get("longitude_column", "longitude"): "longitude",
+              response.get("cell_id_column", "cell_id"): "cell_id"}
+    frame = frame.rename(columns=rename)
+    required = ALL_FEATURE_NAMES + ["year", "latitude", "longitude", "cell_id", response["target_column"]]
+    missing = set(required) - set(frame)
+    if missing:
+        raise ValueError(f"{path}: missing columns {sorted(missing)}")
+    numeric = [name for name in required if name != "cell_id"]
+    for name in set(numeric):
+        frame[name] = pd.to_numeric(frame[name], errors="raise")
+    if not np.allclose(frame.year.dropna(), np.round(frame.year.dropna()), atol=1e-6, rtol=0):
+        raise ValueError("Table year values must be integer calendar years.")
+    valid = np.isfinite(frame[numeric].to_numpy(dtype=float)).all(axis=1)
+    valid &= frame.year.between(*cfg["years"]) & frame.latitude.between(*cfg["latitude_range"])
+    valid &= frame.GSL > cfg.get("minimum_gsl_days", 50)
+    valid &= frame.IGBP.isin(IGBP_CLASSES) & frame.cell_id.notna()
+    if response.get("minimum_response") is not None:
+        valid &= frame[response["target_column"]] > response["minimum_response"]
+    frame = frame.loc[valid].reset_index(drop=True)
+    return Samples(prepare_features(frame[ALL_FEATURE_NAMES]), frame[response["target_column"]].to_numpy(dtype=float),
+                   frame[["cell_id", "year", "latitude", "longitude"]].assign(year=frame.year.astype(int)),
+                   {"format": response["format"], "response": response,
+                    "validity": "Per-record finite required predictors, target and coordinates; configured year/latitude/GSL/response criteria."})
+
+
+def validate_samples(samples):
+    coords = samples.coordinates
+    if not len(coords) or len(samples.X) != len(coords) or len(samples.y) != len(coords):
+        raise ValueError("Empty or inconsistent input samples.")
+    if coords.duplicated(["cell_id", "year"]).any():
+        raise ValueError("Duplicate cell/site-year records; aggregate to annual records before training.")
+    if (coords.groupby("cell_id")[["latitude", "longitude"]].nunique().max(axis=1) > 1).any():
+        raise ValueError("A cell/site identifier has changing coordinates.")
+    if not coords.longitude.between(-180, 180).all():
+        raise ValueError("Longitude must use the -180 to 180 convention.")
+
+
+def temporal_split(coordinates):
+    assignment = np.full(len(coordinates), "excluded_gap", dtype="U24")
+    years = coordinates.year.to_numpy()
+    for subset, (start, end) in TEMPORAL_YEARS.items():
+        assignment[(years >= start) & (years <= end)] = subset
+    return Split("temporal", assignment, coordinates.assign(subset=assignment),
+                 {"year_ranges": {k: list(v) for k, v in TEMPORAL_YEARS.items()},
+                  "gap_years": [2015, 2019], "spatial_buffer_applied": False})
+
+
+def nearest_distance(left, right):
+    if not len(left) or not len(right):
+        return math.inf
+    return float(cKDTree(right).query(left, k=1)[0].min())
+
+
+def spatial_split(coordinates, settings, seed):
+    cells = coordinates.drop_duplicates("cell_id").reset_index(drop=True).copy()
+    transformer = Transformer.from_crs("EPSG:4326", f"EPSG:{settings['epsg']}", always_xy=True)
+    x, y = transformer.transform(cells.longitude.to_numpy(), cells.latitude.to_numpy())
+    xy = np.column_stack([x, y])
+    if not np.isfinite(xy).all():
+        raise ValueError("Projection produced invalid coordinates.")
+    width = settings["block_size_km"] * 1000.0
+    block_xy = np.floor(xy / width).astype(np.int64)
+    cells["projected_x_m"], cells["projected_y_m"] = x, y
+    cells["block_x"], cells["block_y"] = block_xy[:, 0], block_xy[:, 1]
+    blocks, inverse = np.unique(block_xy, axis=0, return_inverse=True)
+    n = len(blocks)
+    fractions = np.asarray(settings["fractions"], dtype=float)
+    if len(fractions) != 3 or np.any(fractions <= 0) or not np.isclose(fractions.sum(), 1):
+        raise ValueError("Spatial fractions must be three positive fractions summing to one.")
+    n_test = max(1, int(math.ceil(n * fractions[2])))
+    n_val = max(1, int(math.ceil(n * fractions[1])))
+    if n - n_test - n_val < 1:
+        raise ValueError(f"Only {n} occupied spatial blocks; insufficient for train/validation/test.")
+    order = np.random.default_rng(seed).permutation(n)
+    block_assignment = np.full(n, "train", dtype="U24")
+    block_assignment[order[:n_test]] = "test"
+    block_assignment[order[n_test:n_test + n_val]] = "validation"
+    assigned = block_assignment[inverse]
+    retained = assigned.copy()
+    buffer_m = settings["buffer_km"] * 1000.0
+    # Preserve test sites. Exclude validation sites near test sites, then exclude
+    # training sites near either original validation or test sites. All years
+    # from an excluded site are excluded together; blocks never cross subsets.
+    for subset, protected in (("validation", ("test",)), ("train", ("validation", "test"))):
+        left = np.flatnonzero(assigned == subset)
+        right = np.flatnonzero(np.isin(assigned, protected))
+        distance = cKDTree(xy[right]).query(xy[left], k=1)[0]
+        retained[left[distance <= buffer_m + 1e-7]] = "excluded_buffer"
+    cells["assigned_subset"] = assigned
+    cells["subset"] = retained
+    gaps = {}
+    for a, b in (("train", "validation"), ("train", "test"), ("validation", "test")):
+        distance = nearest_distance(xy[retained == a], xy[retained == b])
+        if not np.isfinite(distance):
+            raise ValueError(f"Spatial buffering left an empty {a} or {b} subset; inspect coverage and block assignment.")
+        if distance < buffer_m - 1e-6:
+            raise AssertionError("Spatial separation validation failed.")
+        gaps[f"{a}_to_{b}_km"] = distance / 1000.0
+    cell_to_subset = cells.set_index("cell_id")["subset"]
+    assignment = coordinates.cell_id.map(cell_to_subset).to_numpy(dtype="U24")
+    return Split("spatial", assignment, cells,
+                 {"epsg": settings["epsg"], "block_size_km": settings["block_size_km"],
+                  "buffer_km": settings["buffer_km"], "distance_metric": "Euclidean distances in EPSG:6931, metres",
+                  "fractions_before_buffer": fractions.tolist(), "occupied_blocks": n,
+                  "block_seed": seed, "minimum_observed_cross_subset_distances_km": gaps,
+                  "buffer_rule": "Cell-centre buffers, test preserved; all years from buffer-excluded cells removed. Entire blocks are assigned first; buffer exclusions may remove part of an assigned block.",
+                  "block_counts_before_buffer": {s: int((block_assignment == s).sum()) for s in SUBSETS},
+                  "cell_counts_after_buffer": {s: int((retained == s).sum()) for s in (*SUBSETS, "excluded_buffer")}})
+
+
+def validate_split(samples, split):
+    for subset in SUBSETS:
+        if len(split.indices(subset)) < 2:
+            raise ValueError(f"{split.scheme}: {subset} contains fewer than two observations.")
+    if split.scheme == "spatial":
+        assigned = samples.coordinates.assign(subset=split.assignment)
+        if assigned.groupby("cell_id").subset.nunique().max() != 1:
+            raise AssertionError("A cell occurs in multiple spatial subsets.")
+        kept = split.details.loc[split.details.subset.isin(SUBSETS)]
+        if kept.groupby(["block_x", "block_y"]).subset.nunique().max() != 1:
+            raise AssertionError("A block occurs in multiple spatial subsets.")
+    else:
+        for subset, (start, end) in TEMPORAL_YEARS.items():
+            if not samples.coordinates.iloc[split.indices(subset)].year.between(start, end).all():
+                raise AssertionError("Temporal boundaries are incorrect.")
+        if not np.isin(samples.coordinates.year.to_numpy()[split.assignment == "excluded_gap"], [2015, 2019]).all():
+            raise AssertionError("Unexpected temporal exclusions.")
+
+
+def suggest_parameters(trial, search_space):
+    params = {}
+    for name, spec in search_space.items():
+        if spec["type"] == "int":
+            params[name] = trial.suggest_int(name, spec["low"], spec["high"], log=spec.get("log", False))
+        elif spec["type"] == "float":
+            params[name] = trial.suggest_float(name, spec["low"], spec["high"], log=spec.get("log", False))
+        else:
+            raise ValueError(f"Unsupported parameter type: {name}")
+    return params
+
+
+def fit_and_evaluate(samples, split, cfg, output):
+    """The objective receives training and validation data only."""
+    validate_split(samples, split)
+    output.mkdir(parents=True, exist_ok=True)
+    split.details.to_csv(output / "split_membership.csv", index=False)
+    train, val, test = (split.indices(s) for s in SUBSETS)
+    fixed = {"objective": "reg:squarederror", "eval_metric": "rmse", "tree_method": "hist",
+             "enable_categorical": True, "random_state": cfg["seeds"]["xgboost"],
+             "n_jobs": cfg["model_n_jobs"]}
+    search_space = cfg.get("search_space", SEARCH_SPACE)
+    if not search_space or set(search_space) & set(fixed):
+        raise ValueError("The search space must not override fixed settings.")
+    X_train, y_train = samples.X.iloc[train], samples.y[train]
+    X_val, y_val = samples.X.iloc[val], samples.y[val]
+
+    def objective(trial):
+        params = {**suggest_parameters(trial, search_space), **fixed}
+        model = xgb.XGBRegressor(**params)
+        model.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=False)
+        return float(np.sqrt(mean_squared_error(y_val, model.predict(X_val))))
+
+    study = optuna.create_study(direction="minimize", sampler=optuna.samplers.TPESampler(seed=cfg["seeds"]["optuna"]),
+                                pruner=optuna.pruners.NopPruner())
+    study.optimize(objective, n_trials=cfg["n_trials"], n_jobs=1)
+    study.trials_dataframe().to_csv(output / "optuna_trials.csv", index=False)
+    if len(study.trials) != cfg["n_trials"] or any(t.state != optuna.trial.TrialState.COMPLETE for t in study.trials):
+        raise RuntimeError("Not all requested Optuna trials completed.")
+    best = {**study.best_params, **fixed}
+    # Refit from scratch on train + validation. Gap/buffer/test rows stay excluded.
+    refit = np.concatenate([train, val])
+    model = xgb.XGBRegressor(**best)
+    model.fit(samples.X.iloc[refit], samples.y[refit], verbose=False)
+    model_file = output / "model.ubj"
+    model.save_model(model_file)
+    restored = xgb.XGBRegressor()
+    restored.load_model(model_file)
+    (output / "booster_config.json").write_text(restored.get_booster().save_config(), encoding="utf-8")
+    if restored.get_booster().feature_names != ALL_FEATURE_NAMES or restored.get_booster().feature_types[-1] != "c":
+        raise RuntimeError("Saved model did not preserve predictor order or categorical IGBP.")
+    check = samples.X.iloc[refit[:min(256, len(refit))]]
+    if not np.allclose(model.predict(check), restored.predict(check), atol=0, rtol=0):
+        raise RuntimeError("Reloaded model predictions do not match the fitted model.")
+    # Test data are accessed for performance only after all tuning and fitting.
+    truth = samples.y[test]
+    predicted = restored.predict(samples.X.iloc[test])
+    metrics = {"R2": float(r2_score(truth, predicted)),
+               "RMSE": float(np.sqrt(mean_squared_error(truth, predicted))),
+               "MAE": float(mean_absolute_error(truth, predicted))}
+    predictions = samples.coordinates.iloc[test].reset_index(drop=True).copy()
+    predictions["IGBP"] = samples.X.iloc[test]["IGBP"].astype(int).to_numpy()
+    predictions["observed"], predictions["predicted"] = truth, predicted
+    predictions.to_csv(output / "test_predictions.csv", index=False)
+    write_json(output / "metrics.json", metrics)
+    counts = {s: int((split.assignment == s).sum()) for s in np.unique(split.assignment)}
+    record = {"created_at_utc": datetime.now(timezone.utc).isoformat(), "scheme": split.scheme,
+              "response": samples.metadata, "feature_names": ALL_FEATURE_NAMES,
+              "feature_types": restored.get_booster().feature_types, "igbp_categories": IGBP_CLASSES,
+              "n_trials": cfg["n_trials"], "seeds": cfg["seeds"],
+              "search_space": search_space, "fixed_settings": fixed, "best_params": best,
+              "best_validation_RMSE": float(study.best_value), "test_metrics": metrics,
+              "subset_record_counts": counts, "n_final_training_records": len(refit),
+              "final_training_subsets": ["train", "validation"], "test_used_in_tuning_or_refit": False,
+              "all_vegetation_types_pooled": True, "split": split.metadata,
+              "model_format": "UBJSON", "model_file": str(model_file),
+              "versions": {name: version(name) for name in ("xgboost", "optuna", "pyproj", "numpy", "pandas", "scikit-learn")}}
+    write_json(output / "model_metadata.json", record)
+    return {"response": samples.metadata["response"]["name"], "scheme": split.scheme,
+            "n_train": len(train), "n_validation": len(val), "n_test": len(test),
+            "best_validation_RMSE": float(study.best_value), **metrics}
+
+
+def validate_config(cfg):
+    if cfg["years"] != [2001, 2024]:
+        raise ValueError("This manuscript implementation requires the 2001–2024 period.")
+    if not isinstance(cfg["n_trials"], int) or cfg["n_trials"] < 1:
+        raise ValueError("n_trials must be a positive integer; the manuscript setting is 50.")
+    if cfg["spatial"]["epsg"] != 6931 or cfg["spatial"]["block_size_km"] <= 0 or cfg["spatial"]["buffer_km"] < 0:
+        raise ValueError("Use EPSG:6931 with positive block width and nonnegative buffer.")
+    if not cfg["schemes"] or not set(cfg["schemes"]).issubset({"spatial", "temporal"}):
+        raise ValueError("schemes must contain spatial and/or temporal.")
+    responses = [r for r in cfg["responses"] if r.get("enabled", True)]
+    if not responses:
+        raise ValueError("Enable at least one response dataset.")
+    names = [r["name"] for r in responses]
+    if len(set(names)) != len(names) or any(not re.fullmatch(r"[A-Za-z0-9_.-]+", s) or s in (".", "..") for s in names):
+        raise ValueError("Use unique response names containing only letters, numbers, _, -, and periods.")
+    return responses
+
+
+def run(cfg, base, check_only=False):
+    responses = validate_config(cfg)
+    output = Path(cfg["output_dir"])
+    if not output.is_absolute():
+        output = base / output
+    fields = None
+    records = []
+    output.mkdir(parents=True, exist_ok=True)
+    write_json(output / "training_configuration.json", cfg)
+    for response in responses:
+        print(f"Loading response: {response['name']}", flush=True)
+        if response["format"] == "netcdf":
+            if fields is None:
+                fields = load_grid_predictors(cfg, base)
+            samples = load_gridded_samples(cfg, response, base, fields)
+        elif response["format"] in ("csv", "parquet"):
+            samples = load_tabular_samples(cfg, response, base)
+        else:
+            raise ValueError(f"Unknown input format: {response['format']}")
+        validate_samples(samples)
+        for scheme in cfg["schemes"]:
+            split = (spatial_split(samples.coordinates, cfg["spatial"], cfg["seeds"]["spatial_split"])
+                     if scheme == "spatial" else temporal_split(samples.coordinates))
+            validate_split(samples, split)
+            target = output / response["name"] / scheme
+            target.mkdir(parents=True, exist_ok=True)
+            if check_only:
+                split.details.to_csv(target / "split_membership.csv", index=False)
+                counts = {s: int((split.assignment == s).sum()) for s in np.unique(split.assignment)}
+                write_json(target / "split_check.json", {"record_counts": counts, "split": split.metadata})
+                print(f"  {scheme}: {counts}", flush=True)
+            else:
+                print(f"  {scheme}: {cfg['n_trials']} Optuna trials", flush=True)
+                records.append(fit_and_evaluate(samples, split, cfg, target))
+    if records:
+        pd.DataFrame(records).to_csv(output / "evaluation_summary.csv", index=False)
+    return records
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", type=Path)
+    parser.add_argument("--write-config", type=Path)
+    parser.add_argument("--check-only", action="store_true", help="Load inputs and verify splits without tuning or fitting.")
+    args = parser.parse_args()
+    if args.write_config:
+        if args.write_config.exists():
+            raise FileExistsError(f"Configuration already exists: {args.write_config}")
+        write_json(args.write_config, template_config())
+        print(f"Created configuration template: {args.write_config}")
+        return
+    if args.config is None:
+        parser.error("Provide --config, or use --write-config to create a template first.")
+    config_path = args.config.resolve()
+    cfg = json.loads(config_path.read_text(encoding="utf-8-sig"))
+    run(cfg, config_path.parent, args.check_only)
+
+
+if __name__ == "__main__":
+    main()
