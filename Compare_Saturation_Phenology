@@ -1,0 +1,355 @@
+
+from __future__ import annotations
+
+from contextlib import ExitStack
+import csv
+from datetime import datetime, timezone
+import json
+from pathlib import Path
+
+import numpy as np
+import xarray as xr
+
+
+# --------------------------- Path placeholders ---------------------------
+CSIF_FILE = Path(r"PATH_TO_NATIVE_4DAY_CLEAR_SKY_DAILY_MEAN_CSIF.nc")
+MODIS_NDVI_FILE = Path(r"PATH_TO_NATIVE_16DAY_MODIS_NDVI.nc")
+ANNUAL_GSL_FILE = Path(r"PATH_TO_ANNUAL_MODIS_GSL.nc")
+PHENOLOGY_FILE = Path(r"PATH_TO_ANNUAL_MODIS_SOS_EOS.nc")
+SATURATION_FILE = Path(r"PATH_TO_MODEL_DERIVED_SATURATION_THRESHOLDS_AND_FLAGS.nc")
+LAND_COVER_FILE = Path(r"PATH_TO_IGBP_LAND_COVER.nc")
+OUTPUT_NETCDF = Path(r"PATH_TO_OUTPUT_FIG7_COMPARISON.nc")
+OUTPUT_PIXEL_CSV = Path(r"PATH_TO_OUTPUT_FIG7_PIXEL_RESULTS.csv")
+OUTPUT_SUMMARY_JSON = Path(r"PATH_TO_OUTPUT_FIG7_SUMMARY.json")
+
+# Input NetCDFs must use time/lat/lon or annual year/lat/lon coordinates.
+# Continuous inputs must already share one spatial grid; no implicit regridding.
+CSIF_VARIABLE = "clear_daily_SIF"
+NDVI_VARIABLE = "NDVI"
+GSL_VARIABLE = "GSL"
+SOS_VARIABLE, EOS_VARIABLE = "SOS", "EOS"
+THRESHOLD_VARIABLE = "saturation_GSL"
+RELIABILITY_VARIABLE = "reliable_threshold"
+RESPONSE_TYPE_VARIABLE = "response_type"
+LAND_COVER_VARIABLE = "IGBP"
+LAND_COVER_REFERENCE_YEAR = None  # Required only if the supplied cover file has an annual dimension.
+
+START_YEAR, END_YEAR = 2001, 2022
+LATITUDE_RANGE = (30, 90)
+MIN_YEARS_PER_CATEGORY = 1  # Set to 4 for the previously requested robustness analysis.
+MIN_OBSERVATIONS_PER_WINDOW = 1
+MIN_NDVI = 0.0  # Positive NDVI is required for the ratio; use 0.05 only if explicitly adopting that QC rule.
+BASELINE_EPSILON = 1e-12  # Numerical zero guard, not the old mean > 0.01 filter.
+NDVI_MULTIPLIER = 1.0  # xarray decodes CF scale_factor; use 0.0001 only for otherwise unscaled integer NDVI.
+GSL_EVENT_TOLERANCE_DAYS = 1.0  # Accommodates EOS-SOS versus inclusive-day counting.
+STATIC_REINDEX_TOLERANCE = 0.26
+LATITUDE_CHUNK_SIZE = 32
+
+# Assumes standard IGBP codes. Mixed forests (5) belong to Forest.
+# The broader grouping follows the manuscript's inclusion of woody savannas
+# with shrub systems and savannas with grass systems. Edit if land cover has
+# been recoded upstream; these are explicit study groupings, not new IGBP classes.
+VEGETATION_GROUPS = {
+    "Forest": [1, 2, 3, 4, 5], "Shrubland": [6, 7, 8], "Grassland": [9, 10],
+}
+COMPARISON_STATUS = {
+    0: "outside_vegetation_analysis", 1: "unreliable_or_missing_threshold",
+    2: "no_valid_saturation_year", 3: "no_valid_non_saturation_year",
+    4: "insufficient_valid_years_in_one_or_both_categories",
+    5: "nonpositive_or_numerically_zero_non_saturation_mean", 6: "included",
+}
+
+
+def validate_paths():
+    inputs = [CSIF_FILE, MODIS_NDVI_FILE, ANNUAL_GSL_FILE, PHENOLOGY_FILE, SATURATION_FILE, LAND_COVER_FILE]
+    outputs = [OUTPUT_NETCDF, OUTPUT_PIXEL_CSV, OUTPUT_SUMMARY_JSON]
+    for path in inputs + outputs:
+        if "PATH_TO_" in str(path):
+            raise ValueError(f"Fill this path placeholder before running: {path}")
+    for path in inputs:
+        if not path.is_file():
+            raise FileNotFoundError(path)
+    if len({p.resolve() for p in outputs}) != len(outputs):
+        raise ValueError("Output files must have distinct paths.")
+    if {p.resolve() for p in inputs} & {p.resolve() for p in outputs}:
+        raise ValueError("Output paths must not overwrite inputs.")
+    if MIN_YEARS_PER_CATEGORY < 1 or MIN_OBSERVATIONS_PER_WINDOW < 1 or LATITUDE_CHUNK_SIZE < 1:
+        raise ValueError("Minimum counts and chunk size must be positive integers.")
+    codes = [code for values in VEGETATION_GROUPS.values() for code in values]
+    if len(codes) != len(set(codes)):
+        raise ValueError("Vegetation groups must not overlap.")
+
+
+def annual_dataset(path, variables):
+    with xr.open_dataset(path, decode_timedelta=False) as ds:
+        a = ds[list(variables)].sortby("lat").sortby("lon").sel(lat=slice(*LATITUDE_RANGE))
+        dim = "year" if "year" in a.dims else "time"
+        try:
+            years = a[dim].dt.year.values.astype(int)
+        except (AttributeError, TypeError, ValueError):
+            raw = np.asarray(a[dim].values, dtype=float)
+            if not np.isfinite(raw).all() or not np.allclose(raw, np.round(raw), atol=1e-6, rtol=0):
+                raise ValueError(f"Invalid annual coordinates: {path}")
+            years = np.round(raw).astype(int)
+        if len(np.unique(years)) != len(years):
+            raise ValueError(f"Expected one record per calendar year: {path}")
+        a = a.assign_coords({dim: years})
+        if dim != "year":
+            a = a.rename({dim: "year"})
+        a = a.sortby("year").sel(year=slice(START_YEAR, END_YEAR)).transpose("year", "lat", "lon")
+        if not np.array_equal(a.year.values, np.arange(START_YEAR, END_YEAR + 1)):
+            raise ValueError(f"Expected all annual grids for {START_YEAR}–{END_YEAR}: {path}")
+        return a.load()
+
+
+def require_grid(reference, candidate, name):
+    for dim in ("lat", "lon"):
+        if not np.array_equal(reference[dim].values, candidate[dim].values):
+            raise ValueError(f"{name}: {dim} differs from the GSL grid. Harmonize spatial grids before running.")
+
+
+def prepare_series(ds, variable, reference, name):
+    a = ds[variable].sortby("lat").sortby("lon").sortby("time").sel(lat=slice(*LATITUDE_RANGE))
+    if set(a.dims) != {"time", "lat", "lon"}:
+        raise ValueError(f"{name} must have only time, lat and lon dimensions.")
+    a = a.transpose("time", "lat", "lon")
+    require_grid(reference, a, name)
+    if not np.issubdtype(a.time.dtype, np.datetime64):
+        raise ValueError(f"{name} requires dated observation timestamps.")
+    dates = a.time.values
+    if len(dates) < 2 or np.any(np.diff(dates) <= np.timedelta64(0, "D")):
+        raise ValueError(f"{name} timestamps must be unique and increasing.")
+    return a
+
+
+def load_threshold_and_cover(reference):
+    with xr.open_dataset(SATURATION_FILE, decode_timedelta=False) as ds:
+        threshold = ds[[THRESHOLD_VARIABLE, RELIABILITY_VARIABLE, RESPONSE_TYPE_VARIABLE]].sortby("lat").sortby("lon")
+        threshold = threshold.sel(lat=slice(*LATITUDE_RANGE)).transpose("lat", "lon").load()
+        require_grid(reference, threshold, "Saturation thresholds")
+        flags = threshold[RELIABILITY_VARIABLE].values
+        values = threshold[THRESHOLD_VARIABLE].values
+        response_type = threshold[RESPONSE_TYPE_VARIABLE].values
+        bad = (flags == 1) & (~np.isfinite(values) | ~np.isin(response_type, [1, 3]))
+        if np.any(bad):
+            raise ValueError("The threshold file marks invalid/decreasing/unidentified thresholds as reliable.")
+        reliable = (flags == 1) & np.isfinite(values) & np.isin(response_type, [1, 3])
+        if {"historical_GSL_min", "historical_GSL_max"}.issubset(ds):
+            bounds = ds[["historical_GSL_min", "historical_GSL_max"]].sortby("lat").sortby("lon")
+            bounds = bounds.sel(lat=slice(*LATITUDE_RANGE)).transpose("lat", "lon").load()
+            interior = (values > bounds.historical_GSL_min.values) & (values < bounds.historical_GSL_max.values)
+            if np.any(reliable & ~interior):
+                raise ValueError("Reliable thresholds must be strictly inside their historical GSL ranges.")
+    with xr.open_dataset(LAND_COVER_FILE, decode_timedelta=False) as ds:
+        cover = ds[LAND_COVER_VARIABLE]
+        if "year" in cover.dims:
+            if LAND_COVER_REFERENCE_YEAR is None:
+                raise ValueError("Specify LAND_COVER_REFERENCE_YEAR for an annual land-cover file, or supply the study's predefined 2D vegetation map.")
+            cover = cover.sel(year=LAND_COVER_REFERENCE_YEAR, drop=True)
+        elif "time" in cover.dims:
+            if LAND_COVER_REFERENCE_YEAR is None:
+                raise ValueError("Specify LAND_COVER_REFERENCE_YEAR for an annual land-cover file.")
+            try:
+                cover_years = cover.time.dt.year.values
+            except (AttributeError, TypeError, ValueError):
+                cover_years = np.asarray(cover.time.values, dtype=int)
+            indices = np.flatnonzero(cover_years == LAND_COVER_REFERENCE_YEAR)
+            if len(indices) != 1:
+                raise ValueError("The selected land-cover reference year is missing or duplicated.")
+            cover = cover.isel(time=int(indices[0]), drop=True)
+        cover = cover.sortby("lat").sortby("lon").transpose("lat", "lon")
+        cover = cover.reindex(lat=reference.lat, lon=reference.lon, method="nearest", tolerance=STATIC_REINDEX_TOLERANCE).load()
+    return threshold, reliable, cover
+
+
+def annual_window_means(csif, ndvi, gsl, phenology, analysis_domain):
+    years = gsl.year.values.astype(int)
+    shape = (len(years), gsl.sizes["lat"], gsl.sizes["lon"])
+    annual = {name: np.full(shape, np.nan, dtype=np.float32) for name in ("post_SOS", "pre_EOS")}
+    counts = {name: np.zeros(shape, dtype=np.int16) for name in annual}
+    # CSIF observations remain within the declared overlap period.
+    csif = csif.sel(time=slice(f"{START_YEAR}-01-01", f"{END_YEAR}-12-31"))
+    median_step = float(np.median(np.diff(csif.time.values) / np.timedelta64(1, "D")))
+    if not np.isclose(median_step, 4.0, atol=0.01):
+        raise ValueError(f"Expected native four-day CSIF; median timestamp interval is {median_step:g} days.")
+    for iy, year in enumerate(years):
+        origin = np.datetime64(f"{year}-01-01")
+        next_origin = np.datetime64(f"{year + 1}-01-01")
+        # Extending this read permits a window to cross a calendar-year boundary;
+        # its observations are still assigned to the associated phenological year.
+        sif_year = csif.sel(time=slice(origin - np.timedelta64(30, "D"), next_origin + np.timedelta64(30, "D")))
+        if not sif_year.sizes["time"]:
+            continue
+        doy = ((sif_year.time.values - origin) / np.timedelta64(1, "D") + 1).astype(float)
+        ndvi_year = ndvi.sel(time=slice(sif_year.time.values[0] - np.timedelta64(32, "D"),
+                                      sif_year.time.values[-1] + np.timedelta64(32, "D")))
+        if ndvi_year.sizes["time"] < 2:
+            continue
+        days_in_year = int((next_origin - origin) / np.timedelta64(1, "D"))
+        for start in range(0, gsl.sizes["lat"], LATITUDE_CHUNK_SIZE):
+            sl = slice(start, min(start + LATITUDE_CHUNK_SIZE, gsl.sizes["lat"]))
+            if not np.any(analysis_domain[sl, :]):
+                continue
+            sif_chunk = sif_year.isel(lat=sl).load()
+            ndvi_chunk = ndvi_year.isel(lat=sl).load() * NDVI_MULTIPLIER
+            ndvi_chunk = ndvi_chunk.where(np.isfinite(ndvi_chunk) & (ndvi_chunk >= -1) & (ndvi_chunk <= 1))
+            # Only NDVI is interpolated; no extrapolation, interpolation or
+            # additional smoothing is applied to CSIF.
+            interpolated = ndvi_chunk.interp(time=sif_chunk.time, method="linear", assume_sorted=True)
+            values = sif_chunk.values.astype(float)
+            greenness = interpolated.values.astype(float)
+            valid = np.isfinite(values) & np.isfinite(greenness) & (greenness > MIN_NDVI)
+            ratio = np.divide(values, greenness, out=np.full(values.shape, np.nan), where=valid)
+            sos = phenology[SOS_VARIABLE].isel(year=iy, lat=sl).values
+            eos = phenology[EOS_VARIABLE].isel(year=iy, lat=sl).values
+            length = gsl[GSL_VARIABLE].isel(year=iy, lat=sl).values
+            event_valid = (np.isfinite(sos) & np.isfinite(eos) & (sos >= 1) & (eos <= days_in_year)
+                           & (eos > sos) & np.isfinite(length) & (length > 0))
+            event_valid &= analysis_domain[sl, :]
+            disagreement = event_valid & (np.abs(length - (eos - sos)) > GSL_EVENT_TOLERANCE_DAYS)
+            if np.any(disagreement):
+                raise ValueError("Annual GSL is inconsistent with SOS/EOS. Use the same MODIS phenology source.")
+            relative_sos = doy[:, None, None] - sos[None, :, :]
+            relative_eos = doy[:, None, None] - eos[None, :, :]
+            windows = {"post_SOS": (relative_sos >= 0) & (relative_sos < 30),
+                       "pre_EOS": (relative_eos > -30) & (relative_eos <= 0)}
+            for name, window in windows.items():
+                good = valid & window & event_valid[None, :, :]
+                n = good.sum(axis=0)
+                total = np.where(good, ratio, 0).sum(axis=0, dtype=float)
+                mean = np.divide(total, n, out=np.full(n.shape, np.nan), where=n >= MIN_OBSERVATIONS_PER_WINDOW)
+                annual[name][iy, sl, :] = mean
+                counts[name][iy, sl, :] = n
+        print(f"Processed native CSIF/NDVI observations for {year}.", flush=True)
+    return annual, counts, median_step
+
+
+def compare_categories(annual_mean, labels, vegetation, reliable):
+    group_means, group_counts = {}, {}
+    for code, name in ((0, "non_saturation"), (1, "saturation")):
+        valid = (labels == code) & np.isfinite(annual_mean)
+        n = valid.sum(axis=0)
+        total = np.where(valid, annual_mean, 0).sum(axis=0, dtype=float)
+        group_means[name] = np.divide(total, n, out=np.full(n.shape, np.nan), where=n > 0)
+        group_counts[name] = n.astype(np.int16)
+    sat, non = group_means["saturation"], group_means["non_saturation"]
+    n_sat, n_non = group_counts["saturation"], group_counts["non_saturation"]
+    status = np.zeros(vegetation.shape, dtype=np.int8)
+    status[vegetation & ~reliable] = 1
+    eligible = vegetation & reliable
+    status[eligible & (n_sat == 0)] = 2
+    status[eligible & (n_sat > 0) & (n_non == 0)] = 3
+    both = eligible & (n_sat > 0) & (n_non > 0)
+    enough = both & (n_sat >= MIN_YEARS_PER_CATEGORY) & (n_non >= MIN_YEARS_PER_CATEGORY)
+    status[both & ~enough] = 4
+    baseline_ok = np.isfinite(non) & (non > BASELINE_EPSILON)
+    status[enough & ~baseline_ok] = 5
+    included = enough & baseline_ok & np.isfinite(sat)
+    status[included] = 6
+    relative = np.divide(sat - non, non, out=np.full(non.shape, np.nan), where=included)
+    return {"saturation_mean": sat, "non_saturation_mean": non,
+            "saturation_valid_years": n_sat, "non_saturation_valid_years": n_non,
+            "relative_change": relative, "relative_change_percent": relative * 100,
+            "comparison_included": included.astype(np.int8), "comparison_status": status}
+
+
+def summarize(values, mask):
+    selected = values[mask & np.isfinite(values)]
+    n = len(selected)
+    if not n:
+        return {"n_grid_cells": 0, "negative_count": 0, "positive_count": 0, "zero_count": 0,
+                "negative_percent": None, "positive_percent": None, "zero_percent": None,
+                "median_percent": None, "mean_percent": None}
+    return {"n_grid_cells": n, "negative_count": int((selected < 0).sum()),
+            "positive_count": int((selected > 0).sum()), "zero_count": int((selected == 0).sum()),
+            "negative_percent": float(100 * np.mean(selected < 0)),
+            "positive_percent": float(100 * np.mean(selected > 0)),
+            "zero_percent": float(100 * np.mean(selected == 0)),
+            "median_percent": float(np.median(selected)), "mean_percent": float(np.mean(selected))}
+
+
+def main():
+    validate_paths()
+    gsl = annual_dataset(ANNUAL_GSL_FILE, [GSL_VARIABLE])
+    phenology = annual_dataset(PHENOLOGY_FILE, [SOS_VARIABLE, EOS_VARIABLE])
+    require_grid(gsl, phenology, "MODIS SOS/EOS")
+    threshold, reliable, cover = load_threshold_and_cover(gsl)
+    codes = [code for values in VEGETATION_GROUPS.values() for code in values]
+    vegetation = np.isin(cover.values, codes)
+    values = gsl[GSL_VARIABLE].values
+    valid_year = np.isfinite(values) & (values > 0) & reliable[None, :, :] & vegetation[None, :, :]
+    labels = np.full(values.shape, -1, dtype=np.int8)
+    comparison = values > threshold[THRESHOLD_VARIABLE].values[None, :, :]
+    labels[valid_year] = comparison[valid_year].astype(np.int8)
+    with ExitStack() as stack:
+        sif_ds = stack.enter_context(xr.open_dataset(CSIF_FILE))
+        ndvi_ds = stack.enter_context(xr.open_dataset(MODIS_NDVI_FILE))
+        csif = prepare_series(sif_ds, CSIF_VARIABLE, gsl, "Native CSIF")
+        ndvi = prepare_series(ndvi_ds, NDVI_VARIABLE, gsl, "MODIS NDVI")
+        annual, observations, median_step = annual_window_means(csif, ndvi, gsl, phenology, reliable & vegetation)
+    if not any(np.isfinite(array).any() for array in annual.values()):
+        raise ValueError("No valid annual window means. Check native timestamps, MODIS NDVI scaling, phenology, reliable thresholds and input grids.")
+    results = {name: compare_categories(annual[name], labels, vegetation, reliable) for name in annual}
+    dataset = xr.Dataset(coords={"year": gsl.year.values, "lat": gsl.lat.values, "lon": gsl.lon.values})
+    dataset["year_class"] = (("year", "lat", "lon"), labels,
+                              {"flag_values": [-1, 0, 1], "flag_meanings": "invalid non_saturation saturation"})
+    dataset["saturation_GSL"] = threshold[THRESHOLD_VARIABLE]
+    dataset["reliable_threshold"] = (("lat", "lon"), reliable.astype(np.int8))
+    dataset["vegetation_code"] = cover
+    for window, arrays in results.items():
+        dataset[f"{window}_annual_SIF_NDVI"] = (("year", "lat", "lon"), annual[window])
+        dataset[f"{window}_valid_observations"] = (("year", "lat", "lon"), observations[window])
+        for key, array in arrays.items():
+            dataset[f"{window}_{key}"] = (("lat", "lon"), array)
+        dataset[f"{window}_relative_change"].attrs["units"] = "1"
+        dataset[f"{window}_relative_change_percent"].attrs["units"] = "%"
+        dataset[f"{window}_comparison_status"].attrs["flag_values"] = list(COMPARISON_STATUS)
+        dataset[f"{window}_comparison_status"].attrs["flag_meanings"] = " ".join(COMPARISON_STATUS.values())
+    dataset.attrs.update({"period": f"{START_YEAR}–{END_YEAR}", "NDVI_source": "MODIS NDVI, supplied by the user",
+                          "NDVI_interpolation": "Linear interpolation to original CSIF dates; no extrapolation",
+                          "CSIF_temporal_treatment": "Native observations; no interpolation or smoothing",
+                          "windows": "post-SOS [0,30) days; pre-EOS (-30,0] days",
+                          "within_year_aggregation": "Equal-weight mean of valid native CSIF/NDVI ratios",
+                          "between_year_aggregation": "Equal-weight mean of valid annual window means within each category",
+                          "formula": "(saturation_mean - non_saturation_mean) / non_saturation_mean",
+                          "minimum_years_per_category": MIN_YEARS_PER_CATEGORY,
+                          "minimum_NDVI": MIN_NDVI, "minimum_observations_per_window": MIN_OBSERVATIONS_PER_WINDOW,
+                          "threshold_source": str(SATURATION_FILE), "vegetation_groups": json.dumps(VEGETATION_GROUPS)})
+    outputs = [OUTPUT_NETCDF, OUTPUT_PIXEL_CSV, OUTPUT_SUMMARY_JSON]
+    for path in outputs:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    encoding = {name: {"zlib": True, "complevel": 4} for name in dataset.data_vars}
+    for name in dataset.data_vars:
+        if np.issubdtype(dataset[name].dtype, np.floating):
+            encoding[name]["_FillValue"] = np.nan
+    dataset.to_netcdf(OUTPUT_NETCDF, encoding=encoding)
+    summary = {"created_at_utc": datetime.now(timezone.utc).isoformat(), "minimum_years_per_category": MIN_YEARS_PER_CATEGORY,
+               "native_CSIF_median_step_days": median_step, "vegetation_groups": VEGETATION_GROUPS,
+               "sign_denominator": "All included valid grid cells, including any exact zeros",
+               "ecosystem_distributions": "Each included cell contributes once; no tail trimming or value-based sample deletion",
+               "statuses": COMPARISON_STATUS, "sources": {key: str(value) for key, value in
+                   {"CSIF": CSIF_FILE, "MODIS_NDVI": MODIS_NDVI_FILE, "GSL": ANNUAL_GSL_FILE,
+                    "SOS_EOS": PHENOLOGY_FILE, "thresholds": SATURATION_FILE, "land_cover": LAND_COVER_FILE}.items()}}
+    with OUTPUT_PIXEL_CSV.open("w", encoding="utf-8-sig", newline="") as handle:
+        writer = None
+        for window, arrays in results.items():
+            summary[window] = {"all_vegetation": summarize(arrays["relative_change_percent"], vegetation),
+                               "groups": {group: summarize(arrays["relative_change_percent"], np.isin(cover.values, group_codes))
+                                          for group, group_codes in VEGETATION_GROUPS.items()},
+                               "status_counts": {name: int((arrays["comparison_status"] == code).sum()) for code, name in COMPARISON_STATUS.items()}}
+            for i, j in np.argwhere(vegetation):
+                row = {"window": window, "latitude": float(gsl.lat.values[i]), "longitude": float(gsl.lon.values[j]),
+                       "vegetation_code": int(cover.values[i, j]), "reliable_threshold": int(reliable[i, j]),
+                       "saturation_GSL": float(threshold[THRESHOLD_VARIABLE].values[i, j])}
+                row.update({key: array[i, j].item() for key, array in arrays.items()})
+                row["comparison_status_name"] = COMPARISON_STATUS[row["comparison_status"]]
+                if writer is None:
+                    writer = csv.DictWriter(handle, fieldnames=list(row))
+                    writer.writeheader()
+                writer.writerow(row)
+    OUTPUT_SUMMARY_JSON.write_text(json.dumps(summary, ensure_ascii=False, indent=2, allow_nan=False), encoding="utf-8")
+    print(f"Saved grid-cell comparisons: {OUTPUT_NETCDF}")
+
+
+if __name__ == "__main__":
+    main()
