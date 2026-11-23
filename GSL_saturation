@@ -1,0 +1,476 @@
+"""Grid-cell GSL saturation thresholds from a fixed annual-GLASS-GPP model.
+
+Configure every PATH_TO_* placeholder before running this script.
+This file is independent of the original threshold script.
+
+At every candidate GSL, predict all observed cell-year predictor records while
+changing only GSL. Bootstrap whole annual records 50 times with replacement;
+each bootstrap response curve is the mean of its sampled annual predictions.
+The final curve is the pointwise median of those 50 curves. Reusing the fixed
+model's cell-year/candidate prediction matrix is exactly equivalent to
+re-predicting the same records in every bootstrap iteration. The XGBoost model
+is not refitted during bootstrapping.
+
+Primary and sensitivity detection use 10% and 5% of the maximum pre-peak
+derivative. A reported threshold requires a retained increasing interval and
+must be strictly inside the observed GSL range and candidate search range.
+Decreasing responses and all unidentified/boundary thresholds are unreliable.
+No reliability percentage is assumed in advance; summaries use actual counts.
+"""
+from __future__ import annotations
+
+import csv
+from dataclasses import dataclass
+from datetime import datetime, timezone
+import json
+from pathlib import Path
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+import numpy as np
+import pandas as pd
+from scipy.signal import savgol_filter
+import xarray as xr
+import xgboost as xgb
+
+
+# -------------------- Configure input/output path placeholders --------------------
+MODEL_FILE = Path(r"PATH_TO_XGBOOST_MODEL.ubj")
+MODEL_METADATA_FILE = Path(r"PATH_TO_MODEL_METADATA.json")
+GSL_FILE = Path(r"PATH_TO_ANNUAL_MODIS_GSL.nc")
+CLIMATE_FILE = Path(r"PATH_TO_GROWING_AND_NON_GROWING_SEASON_CLIMATE.nc")
+SPEI_FILE = Path(r"PATH_TO_GROWING_AND_NON_GROWING_SEASON_SPEI.nc")
+GPP_FILE = Path(r"PATH_TO_ANNUAL_GLASS_GPP.nc")
+IGBP_FILE = Path(r"PATH_TO_IGBP_LAND_COVER.nc")
+SOIL_CLAY_FILE = Path(r"PATH_TO_SOIL_CLAY.nc")
+SOIL_SOC_FILE = Path(r"PATH_TO_SOIL_ORGANIC_CARBON.nc")
+OUTPUT_NETCDF = Path(r"PATH_TO_OUTPUT_SATURATION_THRESHOLDS.nc")
+OUTPUT_PIXEL_CSV = Path(r"PATH_TO_OUTPUT_PIXEL_THRESHOLD_FLAGS.csv")
+OUTPUT_CURVE_CSV = Path(r"PATH_TO_OUTPUT_BOOTSTRAP_MEDIAN_CURVES.csv")
+OUTPUT_SUMMARY_JSON = Path(r"PATH_TO_OUTPUT_RELIABILITY_SUMMARY.json")
+
+EXPECTED_RESPONSE_NAME = "GLASS_GPP"
+START_YEAR, END_YEAR = 2001, 2024
+LATITUDE_RANGE = (30, 90)
+STATIC_REINDEX_TOLERANCE = 0.26
+MIN_YEARS = 5
+MIN_DISTINCT_GSL = 3
+MIN_GSL_DAYS = 50
+GSL_STEP = 1.0
+N_BOOTSTRAP = 50
+BOOTSTRAP_SEED = 42
+PRIMARY_DERIVATIVE_RATIO = 0.10
+SENSITIVITY_DERIVATIVE_RATIO = 0.05
+SEGMENT_GAIN_RATIO = 0.02
+SG_WINDOW_RATIO = 0.25
+SG_POLYORDER = 3
+DECLINE_AMPLITUDE_RATIO = 0.05
+EARLY_PEAK_FRACTION = 0.10
+PERSISTENT_TAIL_POINTS = 5
+N_WORKERS = 4
+SAVE_CURVES = True
+PROGRESS_EVERY = 100
+
+DYNAMIC_FEATURE_NAMES = [
+    "GSL", "GS_temp", "GS_SM", "GS_SSRD", "GS_RH", "GS_SPEI",
+    "NGS_temp", "NGS_SM", "NGS_SSRD", "NGS_RH", "NGS_SPEI",
+]
+STATIC_FEATURE_NAMES = ["Soil_clay", "Soil_soc", "IGBP"]
+FEATURE_NAMES = DYNAMIC_FEATURE_NAMES + STATIC_FEATURE_NAMES
+IGBP_CLASSES = list(range(1, 11))
+CLIMATE_VARIABLES = {
+    "GS_temp": "GS_TEMP_C", "GS_SM": "GS_SM_0_100cm_m3m3",
+    "GS_SSRD": "GS_SSRD_Wm2", "GS_RH": "GS_RH_percent",
+    "NGS_temp": "NGS_TEMP_C", "NGS_SM": "NGS_SM_0_100cm_m3m3",
+    "NGS_SSRD": "NGS_SSRD_Wm2", "NGS_RH": "NGS_RH_percent",
+}
+SPEI_VARIABLES = {"GS_SPEI": "GS_SPEI_03", "NGS_SPEI": "NGS_SPEI_03"}
+
+# response_type describes the detection outcome; reliability has a separate flag.
+RESPONSE_TYPES = {
+    0: "not_classified", 1: "increasing_or_plateau_with_reliable_saturation",
+    2: "no_reliable_saturation_identified", 3: "unimodal_with_reliable_saturation",
+    4: "decreasing",
+}
+THRESHOLD_STATUSES = {
+    0: "not_assessed", 1: "reliable_interior_threshold", 2: "decreasing_response",
+    3: "insufficient_valid_years", 4: "insufficient_historical_GSL_variation",
+    5: "constant_or_invalid_curve", 6: "no_positive_pre_peak_derivative",
+    7: "no_retained_increasing_interval", 8: "lower_search_endpoint",
+    9: "upper_search_endpoint", 10: "outside_historical_GSL_range",
+    11: "prediction_or_processing_error", 12: "search_grid_too_short_for_smoothing",
+}
+_thread_state = threading.local()
+
+
+@dataclass
+class ThresholdResult:
+    saturation_GSL: float = np.nan
+    candidate_saturation_GSL: float = np.nan
+    response_type: int = 2
+    reliable_threshold: int = 0
+    threshold_status: int = 7
+    smoothed_curve: np.ndarray | None = None
+    first_derivative: np.ndarray | None = None
+
+
+def validate_paths():
+    inputs = [MODEL_FILE, MODEL_METADATA_FILE, GSL_FILE, CLIMATE_FILE, SPEI_FILE,
+              GPP_FILE, IGBP_FILE, SOIL_CLAY_FILE, SOIL_SOC_FILE]
+    outputs = [OUTPUT_NETCDF, OUTPUT_PIXEL_CSV, OUTPUT_SUMMARY_JSON]
+    if SAVE_CURVES:
+        outputs.append(OUTPUT_CURVE_CSV)
+    for path in inputs + outputs:
+        if "PATH_TO_" in str(path):
+            raise ValueError(f"Replace this path placeholder before running: {path}")
+    for path in inputs:
+        if not path.is_file():
+            raise FileNotFoundError(path)
+    resolved_outputs = [path.resolve() for path in outputs]
+    if len(set(resolved_outputs)) != len(outputs):
+        raise ValueError("Output files must use different paths.")
+    if set(resolved_outputs) & {path.resolve() for path in inputs}:
+        raise ValueError("An output path would overwrite an input file.")
+
+
+def validate_model_contract():
+    metadata = json.loads(MODEL_METADATA_FILE.read_text(encoding="utf-8-sig"))
+    if metadata.get("feature_names") != FEATURE_NAMES:
+        raise ValueError("Model metadata must match all 14 predictors, including both SPEI variables, in FEATURE_NAMES order.")
+    if metadata.get("igbp_categories") != IGBP_CLASSES:
+        raise ValueError("Model metadata has a different IGBP category definition.")
+    response = metadata.get("response", {})
+    if isinstance(response, dict) and isinstance(response.get("response"), dict):
+        response = response["response"]
+    if isinstance(response, dict) and response.get("name") not in (None, EXPECTED_RESPONSE_NAME):
+        raise ValueError("The selected model metadata identifies a different response dataset.")
+    model = xgb.XGBRegressor()
+    model.load_model(MODEL_FILE)
+    booster = model.get_booster()
+    if booster.feature_names != FEATURE_NAMES or not booster.feature_types or booster.feature_types[-1] != "c":
+        raise ValueError("Model feature names/order or categorical IGBP do not match this script.")
+    return metadata
+
+
+def get_model():
+    model = getattr(_thread_state, "model", None)
+    if model is None:
+        model = xgb.XGBRegressor()
+        model.load_model(MODEL_FILE)
+        model.get_booster().set_param("nthread", 1)
+        _thread_state.model = model
+    return model
+
+
+def read_annual(path, variables):
+    with xr.open_dataset(path) as ds:
+        a = ds[list(variables)].sortby("lat").sortby("lon")
+        a = a.sel(lat=slice(*LATITUDE_RANGE))
+        dim = "year" if "year" in a.dims else "time"
+        try:
+            years = a[dim].dt.year.values.astype(int)
+        except (AttributeError, TypeError, ValueError):
+            values = np.asarray(a[dim].values, dtype=float)
+            if not np.isfinite(values).all() or not np.allclose(values, np.round(values), atol=1e-6, rtol=0):
+                raise ValueError(f"Unrecognized annual coordinate: {path}")
+            years = np.round(values).astype(int)
+        if len(np.unique(years)) != len(years):
+            raise ValueError(f"Annual input contains repeated calendar years: {path}")
+        a = a.assign_coords({dim: years})
+        if dim != "year":
+            a = a.rename({dim: "year"})
+        a = a.sortby("year").sel(year=slice(START_YEAR, END_YEAR)).transpose("year", "lat", "lon")
+        if not np.array_equal(a.year.values, np.arange(START_YEAR, END_YEAR + 1)):
+            raise ValueError(f"Expected all annual records for {START_YEAR}–{END_YEAR}: {path}")
+        return a.load()
+
+
+def load_data():
+    gsl = read_annual(GSL_FILE, ["GSL"])
+    fields = {"GSL": gsl["GSL"].values}
+    for path, mapping in ((CLIMATE_FILE, CLIMATE_VARIABLES), (SPEI_FILE, SPEI_VARIABLES),
+                          (GPP_FILE, {"GPP": "GPP"})):
+        ds = read_annual(path, list(mapping.values()))
+        for dim in ("year", "lat", "lon"):
+            if not np.array_equal(ds[dim].values, gsl[dim].values):
+                raise ValueError(f"{path}: {dim} coordinates differ from GSL. Harmonize inputs before running.")
+        fields.update({name: ds[variable].values for name, variable in mapping.items()})
+    for path, variable, name in ((IGBP_FILE, "IGBP", "IGBP"),
+                                  (SOIL_CLAY_FILE, "T_CLAY", "Soil_clay"),
+                                  (SOIL_SOC_FILE, "T_OC", "Soil_soc")):
+        with xr.open_dataset(path) as ds:
+            a = ds[variable].sortby("lat").sortby("lon").transpose("lat", "lon")
+            a = a.reindex(lat=gsl.lat, lon=gsl.lon, method="nearest", tolerance=STATIC_REINDEX_TOLERANCE)
+            fields[name] = a.values
+    return fields, gsl.year.values, gsl.lat.values, gsl.lon.values
+
+
+def valid_records(fields):
+    static = np.isin(fields["IGBP"], IGBP_CLASSES)
+    for name in STATIC_FEATURE_NAMES:
+        static &= np.isfinite(fields[name])
+    annual = np.isfinite(fields["GPP"]) & (fields["GPP"] > 0)
+    annual &= fields["GSL"] > MIN_GSL_DAYS
+    for name in DYNAMIC_FEATURE_NAMES:
+        annual &= np.isfinite(fields[name])
+    annual &= static[None, :, :]
+    # Assess vegetation cells with at least one eligible annual record; cells
+    # with fewer than MIN_YEARS are explicitly flagged, rather than hidden.
+    assessed = static & annual.any(axis=0)
+    return annual, assessed
+
+
+def make_candidate_grid(lower, upper):
+    # A lower-anchored regular one-day grid. Never extend above historical max.
+    # For noninteger ranges, the last full one-day step can be below upper.
+    steps = int(np.floor((upper - lower) / GSL_STEP + 1e-10))
+    grid = lower + np.arange(steps + 1, dtype=float) * GSL_STEP
+    return grid[grid <= upper + 1e-10]
+
+
+def detect_saturation(grid, curve, historical_min, historical_max, derivative_ratio):
+    """Detect one threshold; unreliable thresholds stay NaN and carry a reason."""
+    result = ThresholdResult()
+    n = len(grid)
+    if n < 5:
+        result.threshold_status = 12
+        return result
+    if len(curve) != n or not np.isfinite(curve).all() or not np.all(np.diff(grid) > 0):
+        result.threshold_status = 5
+        return result
+    window = max(5, int(n * SG_WINDOW_RATIO))
+    if window % 2 == 0:
+        window += 1
+    window = min(window, n if n % 2 else n - 1)
+    smoothed = savgol_filter(curve, window_length=window, polyorder=min(SG_POLYORDER, window - 1), mode="interp")
+    derivative = np.gradient(smoothed, grid, edge_order=1)
+    result.smoothed_curve, result.first_derivative = smoothed, derivative
+    amplitude = float(np.ptp(smoothed))
+    tolerance = 100 * np.finfo(float).eps * max(1.0, float(np.max(np.abs(smoothed))))
+    if amplitude <= tolerance:
+        result.threshold_status = 5
+        return result
+    # Find the smoothed peak associated with the original curve's maximum.
+    peak = int(np.argmax(curve))
+    if derivative[peak] > 0:
+        while peak < n - 1 and derivative[peak] > 0:
+            peak += 1
+    else:
+        while peak > 0 and derivative[peak] < 0:
+            peak -= 1
+    rise = float(smoothed[peak] - np.min(smoothed[:peak + 1]))
+    decline_margin = DECLINE_AMPLITUDE_RATIO * amplitude
+    early_or_no_rise = peak / (n - 1) <= EARLY_PEAK_FRACTION or rise < decline_margin
+    tail = smoothed[-PERSISTENT_TAIL_POINTS:]
+    enough_post_peak = n - peak - 1 >= PERSISTENT_TAIL_POINTS
+    persistent_fall = enough_post_peak and bool(np.all(tail < smoothed[peak] - decline_margin))
+    if early_or_no_rise and persistent_fall:
+        result.response_type, result.threshold_status = 4, 2
+        return result
+    if peak == 0:
+        result.threshold_status = 6
+        return result
+    pre_peak = derivative[:peak]
+    maximum_derivative = float(np.max(pre_peak))
+    if maximum_derivative <= tolerance:
+        result.threshold_status = 6
+        return result
+    maximum_index = int(np.argmax(pre_peak))
+    increasing = np.flatnonzero(pre_peak > derivative_ratio * maximum_derivative)
+    if not len(increasing):
+        result.threshold_status = 7
+        return result
+    segments = np.split(increasing, np.flatnonzero(np.diff(increasing) > 1) + 1)
+    retained = []
+    for segment in segments:
+        gain = float(smoothed[segment[-1]] - smoothed[segment[0]])
+        if gain > SEGMENT_GAIN_RATIO * amplitude or np.any(segment == maximum_index):
+            retained.append(segment)
+    if not retained:
+        result.threshold_status = 7
+        return result
+    saturation_index = int(retained[-1][-1]) + 1
+    candidate = float(grid[saturation_index])
+    result.candidate_saturation_GSL = candidate
+    # Only actual endpoints are excluded; there is no three-point edge buffer.
+    if saturation_index == 0 or candidate <= historical_min:
+        result.threshold_status = 8
+        return result
+    if saturation_index == n - 1 or candidate >= historical_max:
+        result.threshold_status = 9
+        return result
+    if not historical_min < candidate < historical_max:
+        result.threshold_status = 10
+        return result
+    result.saturation_GSL = candidate
+    result.reliable_threshold, result.threshold_status = 1, 1
+    # A peak followed by a persistent fall is unimodal unless already decreasing.
+    result.response_type = 3 if persistent_fall else 1
+    return result
+
+
+def process_pixel(pixel, fields, annual_valid):
+    i, j = map(int, pixel)
+    keep = annual_valid[:, i, j]
+    n_years = int(keep.sum())
+    lower = upper = np.nan
+    grid = median_curve = None
+    primary = sensitivity = None
+    error = ""
+    try:
+        observed_gsl = fields["GSL"][keep, i, j].astype(float)
+        if len(observed_gsl):
+            lower, upper = float(observed_gsl.min()), float(observed_gsl.max())
+        if n_years < MIN_YEARS:
+            primary = ThresholdResult(threshold_status=3)
+        elif np.unique(observed_gsl).size < MIN_DISTINCT_GSL or upper <= lower:
+            primary = ThresholdResult(threshold_status=4)
+        else:
+            grid = make_candidate_grid(lower, upper)
+            values = {name: fields[name][keep, i, j].astype(np.float32) for name in DYNAMIC_FEATURE_NAMES}
+            values.update({name: np.repeat(fields[name][i, j], n_years).astype(np.float32)
+                           for name in STATIC_FEATURE_NAMES})
+            frame = pd.DataFrame(values, columns=FEATURE_NAMES)
+            frame["IGBP"] = pd.Categorical(frame["IGBP"].astype(int), categories=IGBP_CLASSES)
+            repeated = frame.loc[frame.index.repeat(len(grid))].reset_index(drop=True)
+            repeated["GSL"] = np.tile(grid, n_years).astype(np.float32)
+            predictions = np.asarray(get_model().predict(repeated), dtype=float).reshape(n_years, len(grid))
+            if not np.isfinite(predictions).all():
+                raise ValueError("Model returned nonfinite predictions.")
+            rng = np.random.default_rng(np.random.SeedSequence([BOOTSTRAP_SEED, i, j]))
+            bootstrap_curves = np.empty((N_BOOTSTRAP, len(grid)), dtype=float)
+            for bootstrap_index in range(N_BOOTSTRAP):
+                sampled_years = rng.integers(0, n_years, size=n_years)
+                bootstrap_curves[bootstrap_index] = predictions[sampled_years].mean(axis=0)
+            median_curve = np.median(bootstrap_curves, axis=0)
+            primary = detect_saturation(grid, median_curve, lower, upper, PRIMARY_DERIVATIVE_RATIO)
+            sensitivity = detect_saturation(grid, median_curve, lower, upper, SENSITIVITY_DERIVATIVE_RATIO)
+        if sensitivity is None:
+            sensitivity = ThresholdResult(threshold_status=primary.threshold_status)
+    except Exception as exc:
+        error = f"{type(exc).__name__}: {exc}"
+        primary = ThresholdResult(response_type=0, threshold_status=11)
+        sensitivity = ThresholdResult(response_type=0, threshold_status=11)
+    return {"i": i, "j": j, "valid_years_count": n_years,
+            "historical_GSL_min": lower, "historical_GSL_max": upper,
+            "primary": primary, "sensitivity": sensitivity,
+            "grid": grid, "median_curve": median_curve, "error": error}
+
+
+def output_pixel_row(item, lat, lon):
+    row = {"latitude": float(lat[item["i"]]), "longitude": float(lon[item["j"]]),
+           "valid_years_count": item["valid_years_count"],
+           "historical_GSL_min": item["historical_GSL_min"], "historical_GSL_max": item["historical_GSL_max"]}
+    for key, suffix in (("primary", ""), ("sensitivity", "_5pct")):
+        result = item[key]
+        for name in ("saturation_GSL", "candidate_saturation_GSL", "response_type", "reliable_threshold", "threshold_status"):
+            row[name + suffix] = getattr(result, name)
+        row["threshold_status_name" + suffix] = THRESHOLD_STATUSES[result.threshold_status]
+    row["error"] = item["error"]
+    return row
+
+
+def main():
+    validate_paths()
+    model_metadata = validate_model_contract()
+    fields, years, lat, lon = load_data()
+    annual_valid, assessed = valid_records(fields)
+    pixels = np.argwhere(assessed)
+    if not len(pixels):
+        raise ValueError("No vegetation cells have valid annual records.")
+    shape = assessed.shape
+    maps = {"assessed_mask": assessed.astype(np.int8),
+            "valid_years_count": annual_valid.sum(axis=0).astype(np.int16),
+            "historical_GSL_min": np.full(shape, np.nan, dtype=np.float64),
+            "historical_GSL_max": np.full(shape, np.nan, dtype=np.float64)}
+    for suffix in ("", "_5pct"):
+        for name in ("saturation_GSL", "candidate_saturation_GSL"):
+            maps[name + suffix] = np.full(shape, np.nan, dtype=np.float64)
+        maps["response_type" + suffix] = np.zeros(shape, dtype=np.int8)
+        maps["reliable_threshold" + suffix] = np.full(shape, -1, dtype=np.int8)
+        maps["threshold_status" + suffix] = np.zeros(shape, dtype=np.int8)
+    for path in (OUTPUT_NETCDF, OUTPUT_PIXEL_CSV, OUTPUT_SUMMARY_JSON):
+        path.parent.mkdir(parents=True, exist_ok=True)
+    curve_stream = None
+    try:
+        if SAVE_CURVES:
+            OUTPUT_CURVE_CSV.parent.mkdir(parents=True, exist_ok=True)
+            curve_stream = OUTPUT_CURVE_CSV.open("w", newline="", encoding="utf-8-sig")
+            curve_writer = csv.DictWriter(curve_stream, fieldnames=["latitude", "longitude", "GSL_sequence",
+                                          "bootstrap_median_GPP", "smoothed_GPP", "first_derivative"])
+            curve_writer.writeheader()
+        with OUTPUT_PIXEL_CSV.open("w", newline="", encoding="utf-8-sig") as stream:
+            writer = None
+            with ThreadPoolExecutor(max_workers=N_WORKERS) as pool:
+                futures = [pool.submit(process_pixel, pixel, fields, annual_valid) for pixel in pixels]
+                for number, future in enumerate(as_completed(futures), start=1):
+                    item = future.result()
+                    i, j = item["i"], item["j"]
+                    row = output_pixel_row(item, lat, lon)
+                    if writer is None:
+                        writer = csv.DictWriter(stream, fieldnames=list(row))
+                        writer.writeheader()
+                    writer.writerow(row)
+                    for name in maps:
+                        if name in row:
+                            maps[name][i, j] = row[name]
+                    if SAVE_CURVES and item["median_curve"] is not None:
+                        def sequence(values):
+                            return "" if values is None else ",".join(format(float(value), ".12g") for value in values)
+                        curve_writer.writerow({"latitude": lat[i], "longitude": lon[j],
+                            "GSL_sequence": sequence(item["grid"]),
+                            "bootstrap_median_GPP": sequence(item["median_curve"]),
+                            "smoothed_GPP": sequence(item["primary"].smoothed_curve),
+                            "first_derivative": sequence(item["primary"].first_derivative)})
+                    if number % PROGRESS_EVERY == 0 or number == len(pixels):
+                        print(f"Processed {number}/{len(pixels)} cells", flush=True)
+    finally:
+        if curve_stream is not None:
+            curve_stream.close()
+    ds = xr.Dataset({name: (("lat", "lon"), values) for name, values in maps.items()},
+                    coords={"lat": lat, "lon": lon})
+    for suffix in ("", "_5pct"):
+        ds["reliable_threshold" + suffix].attrs.update(
+            flag_values=np.array([-1, 0, 1], dtype=np.int8), flag_meanings="not_assessed unreliable reliable")
+        ds["response_type" + suffix].attrs.update(
+            flag_values=np.array(list(RESPONSE_TYPES), dtype=np.int8), flag_meanings=" ".join(RESPONSE_TYPES.values()))
+        ds["threshold_status" + suffix].attrs.update(
+            flag_values=np.array(list(THRESHOLD_STATUSES), dtype=np.int8), flag_meanings=" ".join(THRESHOLD_STATUSES.values()))
+        ds["saturation_GSL" + suffix].attrs.update(units="days", description="Reliable interior saturation threshold; unreliable estimates are missing.")
+        ds["candidate_saturation_GSL" + suffix].attrs.update(units="days", description="Detected candidate before boundary/reliability checks; diagnostic only.")
+    ds.attrs.update(target="annual GLASS GPP", bootstrap_replicates=N_BOOTSTRAP, bootstrap_seed=BOOTSTRAP_SEED,
+                    primary_derivative_ratio=PRIMARY_DERIVATIVE_RATIO, sensitivity_derivative_ratio=SENSITIVITY_DERIVATIVE_RATIO,
+                    bootstrap_curve="Mean predictions across resampled whole annual records; pointwise median across replicates",
+                    reliable_threshold_definition="Retained increasing interval, response not classified as decreasing, and strictly interior candidate",
+                    climate_treatment="Observed cell-year seasonal climate predictors retained when varying GSL")
+    encoding = {name: {"zlib": True, "complevel": 4} for name in ds.data_vars}
+    for name in ds.data_vars:
+        if np.issubdtype(ds[name].dtype, np.floating):
+            encoding[name]["_FillValue"] = np.nan
+    ds.to_netcdf(OUTPUT_NETCDF, encoding=encoding)
+    summary = {"created_at_utc": datetime.now(timezone.utc).isoformat(),
+               "assessed_pixels": int(assessed.sum()), "years": [int(years[0]), int(years[-1])],
+               "denominator": "Vegetation cells with finite static predictors and at least one eligible annual record",
+               "minimum_valid_years": MIN_YEARS, "bootstrap_replicates": N_BOOTSTRAP,
+               "bootstrap_seed": BOOTSTRAP_SEED, "model_file": str(MODEL_FILE),
+               "feature_names": FEATURE_NAMES, "model_metadata": model_metadata,
+               "response_types": RESPONSE_TYPES, "threshold_statuses": THRESHOLD_STATUSES}
+    for label, suffix in (("primary_10pct", ""), ("sensitivity_5pct", "_5pct")):
+        flags = maps["reliable_threshold" + suffix][assessed]
+        status = maps["threshold_status" + suffix][assessed]
+        reliable = int((flags == 1).sum())
+        eligible_years = assessed & (maps["valid_years_count"] >= MIN_YEARS)
+        denominator_years = int(eligible_years.sum())
+        summary[label] = {"reliable_pixels": reliable, "unreliable_pixels": int((flags == 0).sum()),
+                          "reliable_percent_of_assessed": 100 * reliable / len(flags),
+                          "unreliable_percent_of_assessed": 100 * (flags == 0).sum().item() / len(flags),
+                          "pixels_with_minimum_years": denominator_years,
+                          "reliable_percent_of_cells_with_minimum_years": 100 * reliable / denominator_years if denominator_years else None,
+                          "reason_counts": {name: int((status == code).sum()) for code, name in THRESHOLD_STATUSES.items()}}
+    OUTPUT_SUMMARY_JSON.write_text(json.dumps(summary, ensure_ascii=False, indent=2, allow_nan=False), encoding="utf-8")
+    print(f"Saved threshold and reliability flags: {OUTPUT_NETCDF}")
+    print(f"Saved reliability proportions: {OUTPUT_SUMMARY_JSON}")
+
+
+if __name__ == "__main__":
+    main()
